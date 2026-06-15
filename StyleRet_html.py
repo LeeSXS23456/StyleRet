@@ -11,27 +11,9 @@ CACHE_FILE = os.path.join(BASE_DIR, "data_base", "fac_ret", "whole_mkt", "factor
 
 plt.rcParams["axes.unicode_minus"] = False
 
-def _setup_chinese_font():
-    import matplotlib.font_manager as fm
-    candidates = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Noto Sans SC", "Noto Sans CJK SC"]
-    for f in fm.fontManager.ttflist:
-        if f.name in candidates:
-            plt.rcParams["font.sans-serif"] = [f.name]
-            return
-    try:
-        import urllib.request
-        fp = "/tmp/NotoSansSC-Regular.otf"
-        if not os.path.exists(fp):
-            urllib.request.urlretrieve(
-                "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf",
-                fp
-            )
-        fm.fontManager.addfont(fp)
-        plt.rcParams["font.sans-serif"] = [fm.FontProperties(fname=fp).get_name()]
-    except:
-        pass
-
-_setup_chinese_font()
+mpl.font_manager.fontManager.addfont('fonts/SimHei.ttf')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
 
 RQ_OK = False
 try:
