@@ -5,15 +5,36 @@ import matplotlib as mpl
 import numpy as np
 import pandas as pd
 import streamlit as st
+from helpfunc_basis import add_basis_data
+import rqdatac
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(BASE_DIR, "data_base", "fac_ret", "whole_mkt", "factor_returns_20_2603.pkl")
+BASIS_DIR = os.path.join(BASE_DIR, "data_base", "basis","index_future_basis_data.pkl")
 
 plt.rcParams["axes.unicode_minus"] = False
 
-mpl.font_manager.fontManager.addfont('fonts/SimHei.ttf')
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
+def _setup_chinese_font():
+    import matplotlib.font_manager as fm
+    candidates = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Noto Sans SC", "Noto Sans CJK SC"]
+    for f in fm.fontManager.ttflist:
+        if f.name in candidates:
+            plt.rcParams["font.sans-serif"] = [f.name]
+            return
+    try:
+        import urllib.request
+        fp = "/tmp/NotoSansSC-Regular.otf"
+        if not os.path.exists(fp):
+            urllib.request.urlretrieve(
+                "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf",
+                fp
+            )
+        fm.fontManager.addfont(fp)
+        plt.rcParams["font.sans-serif"] = [fm.FontProperties(fname=fp).get_name()]
+    except:
+        pass
+
+_setup_chinese_font()
 
 RQ_OK = False
 try:
@@ -132,7 +153,7 @@ st.title("Barra 因子净值可视化")
 st.sidebar.header("配置")
 st.session_state.sd = st.sidebar.date_input("起始", pd.Timestamp("2020-01-02"), max_value=pd.Timestamp("2036-03-25"))
 st.session_state.ed = st.sidebar.date_input("结束", pd.Timestamp("2026-03-25"), max_value=pd.Timestamp("2036-03-25"))
-mode = st.sidebar.radio("模式", ["大类综合", "单因子详细"])
+mode = st.sidebar.radio("模式", ["大类综合", "单因子详细", "基差成本监控"])
 
 sd = pd.Timestamp(st.session_state.sd)
 ed = pd.Timestamp(st.session_state.ed)
@@ -141,6 +162,47 @@ with st.spinner("加载数据中..."):
 if df_full.empty:
     st.error("无可用数据")
     st.stop()
+
+# ---------- 基差数据：读取 + 增量更新 ----------
+def _load_basis():
+    if os.path.exists(BASIS_DIR):
+        try:
+            bd = pd.read_pickle(BASIS_DIR)
+            if isinstance(bd, pd.DataFrame) and not bd.empty:
+                for _cn in ["date", "listed_date", "maturity_date"]:
+                    if _cn in bd.columns:
+                        bd[_cn] = pd.to_datetime(bd[_cn])
+                return bd
+        except:
+            pass
+    return pd.DataFrame()
+
+df_basis = _load_basis()
+if mode == "基差成本监控":
+    if not df_basis.empty:
+        b_max = df_basis["date"].max()
+    else:
+        b_max = sd - pd.Timedelta(days=1)
+    if ed > b_max:
+        try:
+            _new = add_basis_data(b_max, ed)
+            if isinstance(_new, pd.DataFrame) and not _new.empty:
+                for _cn in ["date", "listed_date", "maturity_date"]:
+                    if _cn in _new.columns:
+                        _new[_cn] = pd.to_datetime(_new[_cn])
+                # 确保 _new 也把 order_book_id 当列处理
+                if _new.index.name == "order_book_id":
+                    _new = _new.reset_index()
+                df_basis = pd.concat([df_basis.reset_index(), _new], axis=0)
+                df_basis = (df_basis.drop_duplicates(keep="last")
+                                    .sort_values(["order_book_id", "date"])
+                                    .set_index("order_book_id"))
+                print(df_basis)
+                os.makedirs(os.path.dirname(BASIS_DIR), exist_ok=True)
+                pd.to_pickle(df_basis, BASIS_DIR)
+                print(f"基差数据更新完成: {df_basis['date'].max().date()}")
+        except Exception as _be:
+            st.warning(f"基差数据更新失败: {_be}")
 
 df_view = df_full[(df_full.index >= sd) & (df_full.index <= ed)]
 if df_view.empty:
@@ -163,22 +225,194 @@ if mode == "大类综合":
     if not target:
         st.stop()
     nav = (df_view[target] + 1).cumprod()
-    nav = nav / nav.iloc[0] #净值归1
+    nav = nav / nav.iloc[0]
     order = nav.iloc[-1].sort_values(ascending=False).index
+
+    today_idx = nav.index
+    today = today_idx[-1]
+
+    # ⭐ week_start: 本周之前一周的最后一个交易日
+    monday_nat = today - pd.Timedelta(days=today.weekday())
+    prev_cand = today_idx[today_idx < monday_nat]
+    week_start = prev_cand[-1] if len(prev_cand) > 0 else today
+
+    # ⭐ month_start: 当月第一天的前一个交易日
+    first_of_month = pd.Timestamp(year=today.year, month=today.month, day=1)
+    prev_cand = today_idx[today_idx < first_of_month]
+    month_start = prev_cand[-1] if len(prev_cand) > 0 else today
+    curr_month = pd.Timestamp(year=today.year, month=today.month, day=1)
+    curr_cand = today_idx[today_idx >= curr_month]
+    curr_month_start = curr_cand[0] if len(curr_cand) > 0 else today
+
+    latest_nav = nav.iloc[-1]
+    if len(nav) >= 2:
+        ret_1d = (nav.iloc[-1] / nav.iloc[-2] - 1)
+    else:
+        ret_1d = pd.Series(np.nan, index=nav.columns)
+
+    nav_week = nav.loc[week_start:today]
+    ret_1w = nav_week.iloc[-1] / nav_week.iloc[0] - 1
+
+    nav_month = nav.loc[month_start:today]
+    ret_1m = nav_month.iloc[-1] / nav_month.iloc[0] - 1
+    cum = nav_month / nav_month.iloc[0]
+    dd = (cum - cum.cummax()) / cum.cummax()
+    dd_max = dd.min()
+    month_ret = df_view.loc[curr_month_start:today, target]
+    vol = month_ret.std()
+
+    #核算
+    print(week_start, month_start, curr_month_start,today)
+
+
+    tbl = pd.DataFrame({
+        "最新净值": latest_nav,
+        "1日收益": ret_1d * 100,
+        "本周累计": ret_1w * 100,
+        "本月累计": ret_1m * 100,
+        "本月最大回撤": dd_max * 100,
+        "本月波动率": vol * 100,
+    }).round(4)
+    tbl = tbl.reindex(order)
+
+    #基础净值曲线展示
     fig, ax = plt.subplots(figsize=(12, 6))
     for c in order:
         ax.plot(nav.index, nav[c], label=str(c), lw=1.2)
     ax.axhline(1, color="gray", ls="--", lw=0.6, alpha=0.6)
     ax.set_title(f"{mapping[cat]} nav")
-
     ax.legend(loc="upper left", bbox_to_anchor=(-0.15, 1), fontsize=7.5, ncol=1)
-    # 用tight_layout自动适配图例，避免手动设置left
     plt.tight_layout(rect=[0.15, 0, 1, 1])
-
     ax.grid(alpha=0.3)
     fig.autofmt_xdate()
     st.pyplot(fig)
     plt.close(fig)
+
+    #具体数据表格展示
+    bar_cols = ["1日收益", "本周累计", "本月累计"]
+    styled = tbl.style.format({
+        "最新净值": "{:.4f}",
+        **{c: "{:.2f}%" for c in bar_cols},
+        "本月最大回撤": "{:.2f}%",
+        "本月波动率": "{:.2f}%",
+    }, na_rep="-")
+    for c in bar_cols:
+        styled = styled.bar(subset=[c], align="zero",
+                            color=["#d65f5f", "#5fba7d"], vmin=None, vmax=None)
+    html = styled.set_table_styles([
+        {"selector": "td, th", "props": [("padding", "5px 10px"), ("text-align", "right"), ("white-space", "nowrap")]},
+        {"selector": "th", "props": [("text-align", "left"), ("font-weight", "bold")]},
+    ]).to_html()
+    st.markdown(f"""<div style="overflow-x:auto; width:100%;">{html}</div>""", unsafe_allow_html=True)
+
+elif mode == "基差成本监控":
+    if df_basis.empty:
+        st.error("基差数据为空，请检查数据文件")
+        st.stop()
+    # 每个 order_book_id 的存续期是否与 [sd, ed] 有重叠
+    def _has_overlap(sub):
+        ld = sub["listed_date"].iloc[0]
+        md = sub["maturity_date"].iloc[0]
+        return not (md < sd or ld > ed)
+
+    valid_ids = []
+    for _id, _sub in df_basis.groupby(level="order_book_id", sort=False):
+        if _has_overlap(_sub):
+            valid_ids.append(str(_id))
+
+    if not valid_ids:
+        st.error("当前日期范围内没有可用的合约")
+        st.stop()
+
+    sel_id = st.selectbox("选择合约 (order_book_id)", sorted(valid_ids))
+    sub = df_basis[df_basis.index.get_level_values("order_book_id").astype(str) == sel_id].copy()
+    sub = sub.sort_values("date").reset_index(drop=True)
+
+    # 取该合约在 [sd, ed] 区间内的日期用于绘图
+    plot_sub = sub[(sub["date"] >= sd) & (sub["date"] <= ed)].reset_index(drop=True)
+    if plot_sub.empty:
+        st.warning("所选合约在当前日期区间内没有数据")
+        st.stop()
+
+    # 实时基差：一行表（不含列名）  order_book_id | index | datetime | index_px | future_px | basis | basis_rate | basis_annual_rate
+    try:
+        #from rqdatac.futures import get_current_basis as _gcb
+        _cb = rqdatac.futures.get_current_basis(sel_id, market='cn')
+        if _cb is not None and not _cb.empty:
+            _row = _cb.iloc[0]
+            _fields = ["index", "datetime", "index_px", "future_px",
+                       "basis", "basis_rate", "basis_annual_rate"]
+            _obid = str(_row.name) if _row.name is not None else sel_id
+            _html = f'<table style="width:100%;border-collapse:collapse;font-size:0.75rem;white-space:nowrap;"><tr>'
+            _html += f'<td style="padding:4px 8px;text-align:left;font-weight:bold;border-bottom:1px solid #ccc;">{_obid}</td>'
+            for _k in _fields:
+                if _k in _row:
+                    _v = _row[_k]
+                    if isinstance(_v, (pd.Timestamp, np.datetime64)):
+                        _s = str(pd.Timestamp(_v)).split(".")[0]
+                    else:
+                        try:
+                            _s = f"{float(_v):.3f}"
+                        except Exception:
+                            _s = str(_v)
+                else:
+                    _s = "—"
+                _html += f'<td style="padding:4px 8px;text-align:right;border-bottom:1px solid #ccc;"><span style="color:#888;font-size:0.65rem;">{_k}:</span> {_s}</td>'
+            _html += "</tr></table>"
+            st.markdown(_html, unsafe_allow_html=True)
+    except Exception as e:
+        print(e)
+
+    y1 = plot_sub["abs_ratio"].values * 100
+    y2 = plot_sub["ana_cost"].values * 100
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(plot_sub["date"].values, y1, color="#1f77b4", lw=2, label="abs_ratio (%)")
+    ax2 = ax.twinx()
+    ax2.plot(plot_sub["date"].values, y2, color="#ff7f0e", lw=2, label="ana_cost (%)")
+    ax.set_title(f"基差成本监控 — {sel_id}")
+    ax.set_xlabel("date")
+    ax.set_ylabel("abs_ratio (%)", color="#1f77b4")
+    ax2.set_ylabel("ana_cost (%)", color="#ff7f0e")
+    ax.tick_params(axis="y", labelcolor="#1f77b4")
+    ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc="best")
+    ax.grid(alpha=0.3)
+    fig.autofmt_xdate()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # 转置展示：一个指标一行，一个日期一列；列多时按段S型纵向拼接
+    tbl_b = plot_sub[["date", "abs_ratio", "ana_cost"]].copy()
+    tbl_b["date"] = tbl_b["date"].dt.strftime("%Y-%m-%d")
+    tbl_b["abs_ratio(%)"] = tbl_b["abs_ratio"] * 100
+    tbl_b["ana_cost(%)"] = tbl_b["ana_cost"] * 100
+    tbl_b = tbl_b[["date", "abs_ratio(%)", "ana_cost(%)"]].round(3).tail(30)
+    tbl_b = tbl_b.sort_values("date").reset_index(drop=True)
+    _wide = tbl_b.set_index("date").T
+    _wide.index.name = None
+    _total_cols = list(_wide.columns)
+
+    _cols_per_seg = 20
+    _seg_count = (len(_total_cols) + _cols_per_seg - 1) // _cols_per_seg
+
+    for _si in range(_seg_count):
+        _seg_cols = _total_cols[_si * _cols_per_seg:(_si + 1) * _cols_per_seg]
+        _seg = _wide[_seg_cols]
+
+        _html = (_seg.style.format("{:.3f}").set_table_styles([
+            {"selector": "td, th", "props": [("padding", "3px 6px"),
+                                            ("text-align", "right"),
+                                            ("font-size", "0.8rem"),
+                                            ("white-space", "nowrap")]},
+            {"selector": "th.row_heading", "props": [("text-align", "left"),
+                                                    ("font-weight", "bold")]},
+        ]).to_html())
+        st.markdown(
+            f"""<div style="overflow-x:auto; width:100%; margin-bottom:8px;">{_html}</div>""",
+            unsafe_allow_html=True)
 
 else:
     sub_cat = st.radio("类型", ["风格因子", "行业因子"], horizontal=True)
@@ -214,6 +448,82 @@ else:
     fig.autofmt_xdate()
     st.pyplot(fig)
     plt.close(fig)
+
+    # 单因子指标表：5个最近交易日 + 近20/60日区间
+    row_labels = []
+    ret_list = []
+    pct_list = []
+    z_list = []
+    hist_full = ref.values    # 2020-01-02 起的完整日收益
+    hist_mean = hist_full.mean()
+    hist_std = hist_full.std()
+
+    # 最近第1~5个交易日（单日）
+    for k in range(1, 6):
+        if len(ret) < k:
+            break
+        idx = ret.index[-k]
+        r_val = ret.iloc[-k]
+        p_val = float((hist_full < r_val).sum()) / len(hist_full) * 100
+        z_val = (r_val - hist_mean) / hist_std if hist_std > 0 else np.nan
+        row_labels.append(f"最近第{k}日 ({idx.strftime('%Y-%m-%d')})")
+        ret_list.append(r_val * 100)
+        pct_list.append(p_val)
+        z_list.append(z_val)
+
+    # 近20 / 近60日区间（累计收益）
+    for window in [20, 60]:
+        if len(nav) < window + 1:
+            row_labels.append(f"近{window}日（数据不足）")
+            ret_list.append(np.nan)
+            pct_list.append(np.nan)
+            z_list.append(np.nan)
+            continue
+        cur_ret = nav.iloc[-1] / nav.iloc[-(window + 1)] - 1
+
+        # 以 ref 对应的净值序列做同窗口滚动累计收益，作为历史参照分布
+        ref_nav = (ref + 1).cumprod()
+        if len(ref_nav) > window:
+            ref_idx = ref_nav.index
+            rolling_rets = []
+            for i in range(window, len(ref_nav)):
+                if ref_idx[i] <= ret.index[-1]:
+                    rolling_rets.append(ref_nav.iloc[i] / ref_nav.iloc[i - window] - 1)
+            if len(rolling_rets) > 0:
+                rarr = np.array(rolling_rets)
+                cur_pct = float((rarr < cur_ret).sum()) / len(rarr) * 100
+                cur_z = (cur_ret - rarr.mean()) / rarr.std() if rarr.std() > 0 else np.nan
+            else:
+                cur_pct = np.nan
+                cur_z = np.nan
+        else:
+            cur_pct = np.nan
+            cur_z = np.nan
+
+        row_labels.append(f"近{window}日")
+        ret_list.append(cur_ret * 100)
+        pct_list.append(cur_pct)
+        z_list.append(cur_z)
+
+    tbl_single = pd.DataFrame({
+        "收益率(%)": ret_list,
+        "历史分位数(%)": pct_list,
+        "z值": z_list,
+    }, index=row_labels).round(3)
+
+    bar_s_cols = ["收益率(%)"]
+    styled_single = tbl_single.style.format({
+        "收益率(%)": "{:.3f}%",
+        "历史分位数(%)": "{:.2f}",
+        "z值": "{:.3f}",
+    }, na_rep="-")
+    #styled_single = styled_single.bar(subset=bar_s_cols, align="zero",
+    #                                  color=["#d65f5f", "#5fba7d"])
+    html_s = styled_single.set_table_styles([
+        {"selector": "td, th", "props": [("padding", "5px 10px"), ("text-align", "right"), ("white-space", "nowrap")]},
+        {"selector": "th", "props": [("text-align", "left"), ("font-weight", "bold")]},
+    ]).to_html()
+    st.markdown(f"""<div style="overflow-x:auto; width:100%;">{html_s}</div>""", unsafe_allow_html=True)
 
 with st.expander("📋 数据加载日志"):
     for line in debug_log:
