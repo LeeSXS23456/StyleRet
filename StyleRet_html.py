@@ -155,11 +155,11 @@ div[data-testid="metric-container"] label { font-size: 0.7rem !important; white-
 div[data-testid="metric-container"] div { font-size: 0.8rem !important; }
 </style>
 """, unsafe_allow_html=True)
-st.title("Barra 因子净值可视化")
+st.title("行情面板")
 st.sidebar.header("配置")
 st.session_state.sd = st.sidebar.date_input("起始", pd.Timestamp("2020-01-02"), max_value=pd.Timestamp("2036-03-25"))
 st.session_state.ed = st.sidebar.date_input("结束", pd.Timestamp("2026-03-25"), max_value=pd.Timestamp("2036-03-25"))
-mode = st.sidebar.radio("模式", ["大类综合", "单因子详细", "基差成本监控"])
+mode = st.sidebar.radio("模式", ["Barra大类综合", "Barra单因子详细", "基差成本监控"])
 
 sd = pd.Timestamp(st.session_state.sd)
 ed = pd.Timestamp(st.session_state.ed)
@@ -225,7 +225,7 @@ c2.metric("结束时间", f"{df_view.index.max().date()}")
 c3.metric("交易日", len(df_view))
 c4.metric("因子", f"风格{len(style_cols)} / 行业{len(industry_cols)}")
 
-if mode == "大类综合":
+if mode == "Barra大类综合":
     cat = st.radio("类别", ["风格因子", "行业因子"], horizontal=True)
     target = style_cols if cat == "风格因子" else industry_cols
     if not target:
